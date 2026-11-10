@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Same IPC topology and noise settings as bridge_run, but launches the
+# sample-synchronized version zmq_bridge_ocudu_oai_sample_sync_bridge.py:
+# AODT CIRs are switched by cumulative IQ sample count (not wall clock),
+# DL and UL share one time origin, aligned to a 10 ms frame boundary.
+# Only live AODT (--channel-mode aodt) is supported.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+BRIDGE_CPUS="${BRIDGE_CPUS:-8,10,12,14,16,18}"
+
+# Both bridges bind the same ZMQ IPC endpoints; do not start if either is already running.
+if pgrep -f '[z]mq_bridge_ocudu_oai_(sample_sync_)?bridge\.py' >/dev/null 2>&1; then
+    echo "[bridge_sync] A bridge is already running; stop the old instance first to avoid binding the ZMQ IPC endpoints twice." >&2
+    exit 3
+fi
+# Sample count equals the gNB timestamp only if the bridge forwards both IQ
+# streams from their very first sample. If a previous bridge already forwarded
+# data for the current gNB/UE, the gNB and UE must be restarted.
+if pgrep -f '[o]cudu/build/apps/gnb/gnb' >/dev/null 2>&1 || pgrep -x nr-uesoftmodem >/dev/null 2>&1; then
+    echo "[bridge_sync] Note: gNB/UE is already running. If a previous bridge already forwarded IQ for them," \
+         "the sample time base will be misaligned; restart the gNB and UE." >&2
+fi
+
+BRIDGE_NUMERIC_THREADS="${BRIDGE_NUMERIC_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="$BRIDGE_NUMERIC_THREADS"
+export OMP_NUM_THREADS="$BRIDGE_NUMERIC_THREADS"
+export MKL_NUM_THREADS="$BRIDGE_NUMERIC_THREADS"
+
+BRIDGE_SNR_DB="${BRIDGE_SNR_DB:-30}"
+# By default use a fixed absolute noise floor (consistent with the 100 MHz
+# EBSTR comparison scenario) rather than a per-step relative SNR, so the noise
+# does not change with the signal strength of the current CIR step.
+BRIDGE_NOISE_POWER_DBFS="${BRIDGE_NOISE_POWER_DBFS--65}"
+BRIDGE_NOISE_DIRECTION="${BRIDGE_NOISE_DIRECTION:-both}"
+BRIDGE_NOISE_SEED="${BRIDGE_NOISE_SEED:-20260713}"
+GNB_TX_ENDPOINT="${GNB_TX_ENDPOINT:-ipc:///tmp/phyan100_gnb_tx.ipc}"
+GNB_RX_ENDPOINT="${GNB_RX_ENDPOINT:-ipc:///tmp/phyan100_gnb_rx.ipc}"
+UE_TX_ENDPOINT="${UE_TX_ENDPOINT:-ipc:///tmp/phyan100_ue_tx.ipc}"
+UE_RX_ENDPOINT="${UE_RX_ENDPOINT:-ipc:///tmp/phyan100_ue_rx.ipc}"
+noise_args=()
+if [[ -n "$BRIDGE_NOISE_POWER_DBFS" ]]; then
+    noise_args+=(--noise-power-dbfs "$BRIDGE_NOISE_POWER_DBFS")
+elif [[ "$BRIDGE_SNR_DB" != "off" && -n "$BRIDGE_SNR_DB" ]]; then
+    noise_args+=(--snr-db "$BRIDGE_SNR_DB")
+fi
+if ((${#noise_args[@]})); then
+    noise_args+=(--noise-direction "$BRIDGE_NOISE_DIRECTION" --noise-seed "$BRIDGE_NOISE_SEED")
+fi
+
+BRIDGE_SERVER_ADDRESS="${BRIDGE_SERVER_ADDRESS:-localhost:50051}"
+BRIDGE_YAML_FILE="${BRIDGE_YAML_FILE:-aodt_source/client/examples/msu_1ru_1ue.yaml}"
+BRIDGE_SAMPLE_RATE_HZ="${BRIDGE_SAMPLE_RATE_HZ:-122880000}"
+[[ -s "$BRIDGE_YAML_FILE" ]] || {
+    echo "[bridge_sync] AODT scenario YAML not found: $BRIDGE_YAML_FILE" >&2
+    exit 2
+}
+
+# Number of IQ samples per AODT step. Empty by default: the bridge reads
+# sim_interval from the YAML, N = sim_interval x sample rate, so scenario time
+# equals radio time. Set BRIDGE_CIR_INTERVAL (seconds) or
+# BRIDGE_AODT_STEP_SAMPLES (samples) to override; the bridge prints a warning
+# if it disagrees with sim_interval.
+BRIDGE_CIR_INTERVAL="${BRIDGE_CIR_INTERVAL:-}"
+BRIDGE_AODT_STEP_SAMPLES="${BRIDGE_AODT_STEP_SAMPLES:-}"
+# The common origin after the trigger is rounded up to a multiple of this many samples; empty = one 10 ms frame.
+BRIDGE_ORIGIN_ALIGN_SAMPLES="${BRIDGE_ORIGIN_ALIGN_SAMPLES:-}"
+BRIDGE_PREFETCH_STEPS="${BRIDGE_PREFETCH_STEPS:-2}"
+BRIDGE_FETCH_RETRY_SECONDS="${BRIDGE_FETCH_RETRY_SECONDS:-0.1}"
+step_args=()
+if [[ -n "$BRIDGE_CIR_INTERVAL" ]]; then
+    step_args+=(--cir-interval "$BRIDGE_CIR_INTERVAL")
+fi
+if [[ -n "$BRIDGE_AODT_STEP_SAMPLES" ]]; then
+    step_args+=(--aodt-step-samples "$BRIDGE_AODT_STEP_SAMPLES")
+fi
+if [[ -n "$BRIDGE_ORIGIN_ALIGN_SAMPLES" ]]; then
+    step_args+=(--aodt-origin-align-samples "$BRIDGE_ORIGIN_ALIGN_SAMPLES")
+fi
+
+BRIDGE_SAVE_APPLIED_TAPS="${BRIDGE_SAVE_APPLIED_TAPS:-}"
+# Default 0.0: no power correction is applied to the raw CIR/CFR.
+BRIDGE_PATH_LOSS_DB="${BRIDGE_PATH_LOSS_DB:-0.0}"
+BRIDGE_STOP_WHEN_CIR_EXHAUSTED="${BRIDGE_STOP_WHEN_CIR_EXHAUSTED:-on}"
+# By default, hold the first CIR step after startup to give the OAI UE enough
+# time to complete the full-band scan, random access, and PDU session setup.
+# Once connected, run `touch /tmp/phyan100_start_channel_variation` to start
+# the channel variation. Alternatively, set BRIDGE_INITIAL_HOLD_SECONDS to a
+# positive number to trigger automatically.
+# Note the hold seconds are wall clock; after the trigger, channel variation
+# advances by sample count.
+BRIDGE_STEP_TRIGGER_FILE="${BRIDGE_STEP_TRIGGER_FILE:-/tmp/phyan100_start_channel_variation}"
+BRIDGE_INITIAL_HOLD_SECONDS="${BRIDGE_INITIAL_HOLD_SECONDS:-off}"
+step_trigger_args=()
+if [[ -n "$BRIDGE_STEP_TRIGGER_FILE" ]]; then
+    step_trigger_args+=(--step-trigger-file "$BRIDGE_STEP_TRIGGER_FILE")
+    rm -f -- "$BRIDGE_STEP_TRIGGER_FILE"
+    if [[ "$BRIDGE_INITIAL_HOLD_SECONDS" != "off" && "$BRIDGE_INITIAL_HOLD_SECONDS" != "0" ]]; then
+        ( sleep "$BRIDGE_INITIAL_HOLD_SECONDS"; touch "$BRIDGE_STEP_TRIGGER_FILE" ) &
+        disown
+        echo "[bridge_sync] Holding the first CIR step; channel variation starts in ${BRIDGE_INITIAL_HOLD_SECONDS} s (you can start iperf now)"
+    fi
+fi
+stop_args=()
+if [[ "$BRIDGE_STOP_WHEN_CIR_EXHAUSTED" == "off" ]]; then
+    stop_args+=(--no-stop-when-cir-exhausted)
+fi
+# When not stopping on exhaustion, the default is to stay on the last CIR step;
+# set BRIDGE_LOOP_SCENARIO to loop back to step 0, each step still exactly N samples.
+BRIDGE_LOOP_SCENARIO="${BRIDGE_LOOP_SCENARIO:-off}"
+if [[ "$BRIDGE_LOOP_SCENARIO" != "off" ]]; then
+    stop_args+=(--loop-scenario)
+fi
+# In live AODT mode, --normalize-power normalizes each step to unit energy
+# individually, erasing path loss and step-to-step amplitude changes.
+# Default off, preserving the raw AODT amplitudes.
+BRIDGE_NORMALIZE_POWER="${BRIDGE_NORMALIZE_POWER:-off}"
+power_args=()
+if [[ "$BRIDGE_NORMALIZE_POWER" != "off" ]]; then
+    power_args+=(--normalize-power)
+fi
+
+BRIDGE_PYTHON="${BRIDGE_PYTHON:-aodt_source/.venv/bin/python3}"
+BRIDGE_SYSTEM_SITE_PACKAGES="${BRIDGE_SYSTEM_SITE_PACKAGES:-/usr/lib/python3/dist-packages}"
+export PYTHONPATH="aodt_source/client/build:aodt_source/client/build/config:$BRIDGE_SYSTEM_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
+"$BRIDGE_PYTHON" -c 'import dt_client, scipy, yaml' 2>/dev/null || {
+    echo "[bridge_sync] The sample-sync bridge requires dt_client, scipy, and PyYAML" >&2
+    exit 2
+}
+
+# These two REP endpoints are managed by the bridge itself. gnb_run/ue_run
+# remove their own root-owned TX endpoints before starting their processes.
+for endpoint in "$GNB_RX_ENDPOINT" "$UE_RX_ENDPOINT"; do
+    if [[ "$endpoint" == ipc:///* ]]; then
+        rm -f -- "${endpoint#ipc://}"
+    fi
+done
+
+# Extra command-line arguments (e.g. --ue-delay-us 1.0) are passed through to the bridge as-is.
+taskset -c "$BRIDGE_CPUS" \
+    "$BRIDGE_PYTHON" aodt_source/client/examples/zmq_bridge_ocudu_oai_sample_sync_bridge.py \
+    --channel-mode aodt \
+    --server-address "$BRIDGE_SERVER_ADDRESS" \
+    --yaml-file "$BRIDGE_YAML_FILE" \
+    --samp-rate "$BRIDGE_SAMPLE_RATE_HZ" \
+    "${step_args[@]}" \
+    --aodt-prefetch-steps "$BRIDGE_PREFETCH_STEPS" \
+    --aodt-fetch-retry-seconds "$BRIDGE_FETCH_RETRY_SECONDS" \
+    --save-applied-taps "$BRIDGE_SAVE_APPLIED_TAPS" \
+    --path-loss-db "$BRIDGE_PATH_LOSS_DB" \
+    "${step_trigger_args[@]}" \
+    "${stop_args[@]}" \
+    "${power_args[@]}" \
+    --gnb-tx-endpoint "$GNB_TX_ENDPOINT" --gnb-rx-endpoint "$GNB_RX_ENDPOINT" \
+    --ue-tx-endpoint "$UE_TX_ENDPOINT" --ue-rx-endpoint "$UE_RX_ENDPOINT" \
+    "${noise_args[@]}" \
+    "$@"
